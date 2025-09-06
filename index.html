@@ -1,0 +1,189 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Proctoring Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; gap:20px; padding:20px; }
+    video { border-radius:8px; max-width:640px; width:640px; height:480px; background:#000; }
+    canvas { position:absolute; left:0; top:0; }
+    #controls { max-width:400px; }
+    .alert { padding:12px; border-radius:8px; margin-top:10px; }
+    .ok { background:#e6ffed; border:1px solid #9df0b6; color:#116600; }
+    .warn { background:#fff6e6; border:1px solid #ffd38a; color:#6a4a00; }
+    .bad { background:#ffe6e6; border:1px solid #ff9a9a; color:#990000; }
+  </style>
+</head>
+<body>
+  <div style="position:relative">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay" width="640" height="480"></canvas>
+  </div>
+
+  <div id="controls">
+    <h2>Proctoring Demo</h2>
+    <p>Detects: No face ❌, Multiple faces ❌, Looking away ❌</p>
+
+    <div id="status" class="alert ok">Initializing…</div>
+
+    <label>Seconds allowed without face: 
+      <input id="noFaceThreshold" type="number" value="10" min="1" style="width:60px" />
+    </label>
+    <br/><br/>
+    <label>Seconds allowed looking away: 
+      <input id="awayThreshold" type="number" value="3" min="1" style="width:60px" />
+    </label>
+    <br/><br/>
+    <button id="toggleSound">Toggle Sound</button>
+  </div>
+
+  <!-- face-api.js -->
+  <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+
+  <script>
+  (async () => {
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const ctx = overlay.getContext('2d');
+    const statusDiv = document.getElementById('status');
+    const noFaceInput = document.getElementById('noFaceThreshold');
+    const awayInput = document.getElementById('awayThreshold');
+    const toggleSoundBtn = document.getElementById('toggleSound');
+
+    let soundOn = true;
+    toggleSoundBtn.addEventListener('click', () => { 
+      soundOn = !soundOn; 
+      toggleSoundBtn.textContent = soundOn ? 'Sound: ON' : 'Sound: OFF'; 
+    });
+
+    function playBeep() {
+      if (!soundOn) return;
+      const ctxA = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctxA.createOscillator();
+      const g = ctxA.createGain();
+      o.connect(g); g.connect(ctxA.destination);
+      o.type = 'sine';
+      o.frequency.value = 880;
+      g.gain.value = 0.05;
+      o.start();
+      setTimeout(()=>{ o.stop(); ctxA.close(); }, 400);
+    }
+
+    // load models
+    statusDiv.textContent = 'Loading models…';
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri('https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights'),
+      faceapi.nets.faceLandmark68TinyNet.loadFromUri('https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights')
+    ]);
+
+    statusDiv.textContent = 'Starting camera…';
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" }, audio: false });
+      video.srcObject = stream;
+    } catch (err) {
+      statusDiv.textContent = 'Camera not available or permission denied.';
+      statusDiv.className = 'alert bad';
+      return;
+    }
+
+    // timers
+    let lastFaceSeenAt = Date.now();
+    let lastLookingForwardAt = Date.now();
+    let alertedNoFace = false;
+    let alertedAway = false;
+    let alertedMultiple = false;
+
+    function setStatus(text, cls='ok') {
+      statusDiv.textContent = text;
+      statusDiv.className = 'alert ' + cls;
+    }
+
+    function analyzeDetection(result) {
+      if (!result) return { face:false, lookingAway:false };
+      const box = result.detection.box;
+      const landmarks = result.landmarks;
+      const nose = landmarks.getNose();
+      const noseTip = nose[Math.floor(nose.length/2)];
+      const faceCenterX = box.x + box.width/2;
+      const faceCenterY = box.y + box.height/2;
+
+      const normX = (noseTip.x - faceCenterX) / box.width;
+      const normY = (noseTip.y - faceCenterY) / box.height;
+
+      const lookingAway = Math.abs(normX) > 0.08 || Math.abs(normY) > 0.18;
+      return { face:true, lookingAway };
+    }
+
+    function drawDetections(detections) {
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      detections.forEach(det => {
+        const box = det.detection.box;
+        ctx.strokeStyle = 'lime';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(box.x, box.y, box.width, box.height);
+      });
+    }
+
+    video.addEventListener('play', () => {
+      const intervalMs = 200;
+      const runLoop = async () => {
+        if (video.paused || video.ended) return;
+
+        const detections = await faceapi.detectAllFaces(
+          video, 
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 320 })
+        ).withFaceLandmarks(true);
+
+        const now = Date.now();
+        drawDetections(detections);
+
+        if (detections.length === 0) {
+          const elapsed = (now - lastFaceSeenAt)/1000;
+          setStatus(`No face detected — ${elapsed.toFixed(1)}s`, elapsed > parseFloat(noFaceInput.value) ? 'bad' : 'warn');
+          if (elapsed > parseFloat(noFaceInput.value) && !alertedNoFace) {
+            alertedNoFace = true;
+            playBeep();
+            alert("Alert: No person detected!");
+          }
+        } 
+        else if (detections.length > 1) {
+          setStatus("Multiple persons detected!", "bad");
+          if (!alertedMultiple) {
+            alertedMultiple = true;
+            playBeep();
+            alert("Alert: More than one person detected!");
+          }
+        } 
+        else {
+          // only one person
+          const det = detections[0];
+          const analysis = analyzeDetection(det);
+
+          lastFaceSeenAt = now;
+          alertedNoFace = false;
+          alertedMultiple = false;
+
+          if (!analysis.lookingAway) {
+            lastLookingForwardAt = now;
+            alertedAway = false;
+            setStatus("Face detected — looking at screen", "ok");
+          } else {
+            const elapsedAway = (now - lastLookingForwardAt)/1000;
+            setStatus(`Face detected but looking away — ${elapsedAway.toFixed(1)}s`, elapsedAway > parseFloat(awayInput.value) ? 'bad' : 'warn');
+            if (elapsedAway > parseFloat(awayInput.value) && !alertedAway) {
+              alertedAway = true;
+              playBeep();
+              alert("Please watch your screen!");
+            }
+          }
+        }
+
+        setTimeout(runLoop, intervalMs);
+      };
+
+      runLoop();
+    });
+  })();
+  </script>
+</body>
+</html>
